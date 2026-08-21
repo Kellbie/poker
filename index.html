@@ -680,7 +680,8 @@ function resolveShowdown(state, winnerIds) {
   if (state.street !== 'showdown') throw new Error('Not at showdown');
   awardPot(state, winnerIds);
   state.street = 'handover';
-  state.log.push(`Pot of ${state.potBeforeAward} split between: ${winnerIds.join(', ')}`);
+  const names = winnerIds.map(id => findPlayer(state, id).name).join(', ');
+  state.log.push(`Pot of ${state.potBeforeAward} split between: ${names}`);
 }
 
 function awardPot(state, winnerIds) {
@@ -795,6 +796,13 @@ class HostController {
         this.broadcast();
       } else if (msg.t === 'rematch') {
         this.doRematch();
+      } else if (msg.t === 'leave') {
+        // Explicit, deliberate leave — mark disconnected immediately rather
+        // than waiting on the network to eventually notice the connection
+        // dropped, which can take a long time (or never happen promptly)
+        // especially for a backgrounded mobile PWA. Same semantics as an
+        // accidental disconnect: kept in the room, can rejoin by name.
+        this.handleDisconnect(peerId);
       } else {
         throw new Error('Unknown message type ' + msg.t);
       }
@@ -867,6 +875,16 @@ class HostController {
     const tmp = sorted[idx].seat; sorted[idx].seat = sorted[swapIdx].seat; sorted[swapIdx].seat = tmp;
     this.broadcast();
   }
+  // Best-effort notice sent to every connected guest right before the host
+  // leaves — the game genuinely can't continue without whoever holds the
+  // authoritative state, so guests should be told clearly rather than just
+  // silently losing their connection with no explanation.
+  broadcastHostLeaving() {
+    const payload = JSON.stringify({ t: 'hostLeaving' });
+    for (const conn of this.connections.values()) {
+      if (conn.playerId) { try { conn.channel.send(payload); } catch (e) { /* best effort */ } }
+    }
+  }
 }
 
 // ---- GUEST controller ----
@@ -880,7 +898,11 @@ class GuestController {
     this.onStateChange = (opts && opts.onStateChange) || (() => {});
     this.onError = (opts && opts.onError) || (() => {});
     this.onRejected = (opts && opts.onRejected) || (() => {});
+    this.onDisconnected = (opts && opts.onDisconnected) || (() => {});
+    this.onHostLeaving = (opts && opts.onHostLeaving) || (() => {});
+    this._leftDeliberately = false;
     channel.onmessage = (raw) => this.handleMessage(JSON.parse(raw));
+    channel.onclose = () => { if (!this._leftDeliberately) this.onDisconnected(); };
     channel.send(JSON.stringify({ t: 'hello', name }));
   }
   handleMessage(msg) {
@@ -888,11 +910,21 @@ class GuestController {
     else if (msg.t === 'state') { this.room = msg.room; this.onStateChange(this.room); }
     else if (msg.t === 'error') { this.onError(msg.message); }
     else if (msg.t === 'joinRejected') { this.onRejected(msg.reason); }
+    else if (msg.t === 'hostLeaving') { this.onHostLeaving(); }
   }
   sendAction(action, amount) { this.channel.send(JSON.stringify({ t: 'action', action, amount })); }
   sendDeclareWinners(winnerIds) { this.channel.send(JSON.stringify({ t: 'declareWinners', winnerIds })); }
   sendNextHand() { this.channel.send(JSON.stringify({ t: 'nextHand' })); }
   sendRematch() { this.channel.send(JSON.stringify({ t: 'rematch' })); }
+  // Deliberate leave: tells the host immediately (reliable) rather than
+  // waiting for the network to eventually notice the connection dropped —
+  // which can be slow or may never fire promptly on a backgrounded mobile
+  // PWA. Marks _leftDeliberately so the subsequent connection teardown
+  // doesn't ALSO trigger the "unexpected disconnect" callback.
+  sendLeave() {
+    this._leftDeliberately = true;
+    try { this.channel.send(JSON.stringify({ t: 'leave' })); } catch (e) { /* best effort */ }
+  }
 }
 
 
@@ -1957,11 +1989,11 @@ function renderOnlineHostLobby(code) {
       <p class="hint" style="margin:0 0 12px;">Blinds ${room.smallBlind}/${room.bigBlind}, max bet ${room.maxBet}, starting stack ${room.startingStack.toLocaleString()} each.</p>
       <button class="btn-primary btn-block" id="btn-start" ${players.length < 2 ? 'disabled' : ''}>${players.length < 2 ? 'Waiting for players\u2026' : 'Deal me in \u2014 start the game'}</button>
     </div>`;
-  document.getElementById('btn-leave-lobby').onclick = () => {
-    if (!confirm('Cancel hosting this table?')) return;
+  document.getElementById('btn-leave-lobby').onclick = async () => {
+    if (!await customConfirm('Cancel hosting this table?')) return;
+    host.broadcastHostLeaving();
     location.reload();
   };
-  document.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.up, -1); renderOnlineHostLobby(code); });
   document.querySelectorAll('[data-down]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.down, 1); renderOnlineHostLobby(code); });
   const startBtn = document.getElementById('btn-start');
   if (startBtn) startBtn.onclick = () => { gameAreaActive = true; activeTab = 'table'; host.localStartGame(); };
@@ -1997,6 +2029,8 @@ function renderOnlineGuestEntry() {
         onStateChange: (room) => { me.playerId = guest.playerId; gameAreaActive = true; onRoomUpdated(room); },
         onError: (msg) => { alert(msg); },
         onRejected: (reason) => { showScanError(reason, renderLanding); },
+        onDisconnected: () => showConnectionEndedScreen("Connection lost"),
+        onHostLeaving: () => showConnectionEndedScreen("Host left the table"),
       });
       app.innerHTML = renderConnectingShell('<span class="qr-spinner"></span>Joining the table\u2026');
     } catch (e) {
@@ -2107,8 +2141,9 @@ function renderHostLobby() {
       <button class="btn-primary btn-block" id="btn-start" ${players.length < 2 ? 'disabled' : ''}>${players.length < 2 ? 'Need at least 2 players' : 'Deal me in — start the game'}</button>
     </div>`;
 
-  document.getElementById('btn-leave-lobby').onclick = () => {
-    if (!confirm('Cancel hosting this table?')) return;
+  document.getElementById('btn-leave-lobby').onclick = async () => {
+    if (!await customConfirm('Cancel hosting this table?')) return;
+    host.broadcastHostLeaving();
     location.reload();
   };
   document.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.up, -1); renderHostLobby(); });
@@ -2254,6 +2289,8 @@ function showAnswerQr(answerPayload, pc, dc) {
         onStateChange: (room) => { me.playerId = guest.playerId; gameAreaActive = true; onRoomUpdated(room); },
         onError: (msg) => { alert(msg); },
         onRejected: (reason) => { showScanError(reason, renderLanding); },
+        onDisconnected: () => showConnectionEndedScreen("Connection lost"),
+        onHostLeaving: () => showConnectionEndedScreen("Host left the table"),
       });
       me = { isHost: false, playerId: null, name: guestName };
       startingStackForHistory = null; // learned from room once state arrives
@@ -2396,6 +2433,23 @@ function wirePasteFallback(onPayload) {
 function renderConnectingShell(msgHtml) {
   return `<div class="center-col"><div class="card" style="text-align:center;"><p class="hint" style="font-size:15px;">${msgHtml}</p></div></div>`;
 }
+/* ---------- Connection ended: shown when this device's own connection drops
+   unexpectedly, or the host explicitly leaves — either way the game can't
+   continue, so say so clearly instead of leaving a frozen, stale screen. ---------- */
+function showConnectionEndedScreen(reason) {
+  stopQrLoop();
+  app.classList.remove('has-bottom-nav');
+  app.innerHTML = `
+    <div class="center-col">
+      <div class="card" style="text-align:center;">
+        <h2 class="display" style="font-size:20px;margin:0 0 8px;">${escapeHtml(reason)}</h2>
+        <p class="hint">The game can't continue from here — start fresh whenever you're ready.</p>
+        <button class="btn-primary btn-block" id="conn-ended-ok" style="margin-top:14px;">Back to start</button>
+      </div>
+    </div>`;
+  document.getElementById('conn-ended-ok').onclick = () => location.reload();
+}
+
 function showQrError(msg, backFn) {
   app.innerHTML = `<div class="center-col"><div class="card"><p class="error-text">${escapeHtml(msg)}</p><button class="btn-primary btn-block" id="err-back">Back</button></div></div>`;
   document.getElementById('err-back').onclick = backFn;
@@ -2470,8 +2524,9 @@ function renderGuestWaitingLobby(room) {
         <p class="hint" style="text-align:center;margin-top:12px;">Blinds ${room.smallBlind}/${room.bigBlind} · starting stack ${room.startingStack.toLocaleString()}</p>
       </div>
     </div>`;
-  document.getElementById('btn-leave-lobby').onclick = () => {
-    if (!confirm('Leave this table?')) return;
+  document.getElementById('btn-leave-lobby').onclick = async () => {
+    if (!await customConfirm('Leave this table?')) return;
+    if (guest) guest.sendLeave();
     location.reload();
   };
 }
@@ -2558,6 +2613,42 @@ function showPullToRefreshPulse() {
   el.style.opacity = '0.55';
   setTimeout(() => { el.style.opacity = '1'; }, 140);
   if (currentRoom) renderActiveTab(currentRoom);
+}
+
+/* ---------- Custom confirm dialog (replaces native browser confirm()) ----------
+   Native confirm() renders as a jarring browser-chrome popup with the site's
+   URL in the title — totally out of place against the rest of this app's
+   design. This is a promise-based drop-in replacement using the same
+   bottom-sheet visual language as everything else here. */
+function customConfirm(message, opts) {
+  opts = opts || {};
+  const confirmLabel = opts.confirmLabel || 'Confirm';
+  const cancelLabel = opts.cancelLabel || 'Cancel';
+  const danger = opts.danger !== false; // default to the red/danger button style, since most confirms here are destructive
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'sheet-backdrop';
+    const sheet = document.createElement('div');
+    sheet.className = 'bottom-sheet';
+    sheet.innerHTML = `
+      <div class="sheet-handle"></div>
+      <p style="text-align:center;font-size:14.5px;color:var(--ink);line-height:1.5;margin:0 0 18px;">${escapeHtml(message)}</p>
+      <div class="sheet-actions">
+        <button class="btn-ghost" id="confirm-cancel">${escapeHtml(cancelLabel)}</button>
+        <button class="${danger ? 'btn-danger' : 'btn-primary'}" id="confirm-ok">${escapeHtml(confirmLabel)}</button>
+      </div>`;
+    document.body.appendChild(backdrop);
+    document.body.appendChild(sheet);
+    requestAnimationFrame(() => { backdrop.classList.add('open'); sheet.classList.add('open'); });
+    const settle = (result) => {
+      backdrop.classList.remove('open'); sheet.classList.remove('open');
+      setTimeout(() => { backdrop.remove(); sheet.remove(); }, 240);
+      resolve(result);
+    };
+    backdrop.onclick = () => settle(false);
+    sheet.querySelector('#confirm-cancel').onclick = () => settle(false);
+    sheet.querySelector('#confirm-ok').onclick = () => settle(true);
+  });
 }
 
 function openPlayerDetailSheet(p, room) {
@@ -2863,8 +2954,13 @@ function renderSettingsTab(room, container) {
     </div>`;
   document.getElementById('sound-toggle').onchange = (e) => { setSoundMuted(!e.target.checked); };
   document.getElementById('settings-install').onclick = handleInstallClick;
-  document.getElementById('settings-leave').onclick = () => {
-    if (!confirm('Leave this table? You can rejoin with the same name if the host adds you again.')) return;
+  document.getElementById('settings-leave').onclick = async () => {
+    const msg = me.isHost
+      ? 'Leave this table? This ends the game for everyone still connected.'
+      : 'Leave this table? You can rejoin with the same name if the host adds you again.';
+    if (!await customConfirm(msg)) return;
+    if (me.isHost && host) host.broadcastHostLeaving();
+    else if (guest) guest.sendLeave();
     location.reload();
   };
 }
@@ -2892,7 +2988,11 @@ function wireGameOverButtons(room) {
   const rematchBtn = document.getElementById('btn-rematch');
   if (rematchBtn) rematchBtn.onclick = () => { historySaved = false; host.doRematch(); activeTab = 'table'; };
   const newTableBtn = document.getElementById('btn-new-table');
-  if (newTableBtn) newTableBtn.onclick = () => { if (confirm('Start a brand new table? This ends the current one for everyone.')) location.reload(); };
+  if (newTableBtn) newTableBtn.onclick = async () => {
+    if (!await customConfirm('Start a brand new table? This ends the current one for everyone.')) return;
+    if (host) host.broadcastHostLeaving();
+    location.reload();
+  };
 }
 
 /* ---------- haptics + sound wiring ---------- */
