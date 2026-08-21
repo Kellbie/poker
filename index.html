@@ -1910,6 +1910,7 @@ function renderOnlineHostSetup() {
     host = new HostController(name, { startingStack: stack, startingBet: bet, maxBet: max, onStateChange: (room) => onRoomUpdated(room) });
     me = { isHost: true, playerId: host.hostPlayerId, name };
     currentRoom = host.room;
+    gameAreaActive = true; // connected + past setup — room updates (like a guest joining) should now live-refresh the screen
 
     try {
       const { code } = await createOnlineHost(window.Peer, (wrappedConn) => {
@@ -1917,6 +1918,7 @@ function renderOnlineHostSetup() {
         host.attachConnection(peerId, wrappedConn);
         renderOnlineHostLobby(code);
       });
+      onlineRoomCode = code;
       renderOnlineHostLobby(code);
     } catch (e) {
       showQrError('Could not create an online room: ' + e.message, renderOnlineChoice);
@@ -1925,12 +1927,11 @@ function renderOnlineHostSetup() {
 }
 
 function renderOnlineHostLobby(code) {
-  gameAreaActive = false;
   app.classList.remove('has-bottom-nav');
   const room = host.room;
   const players = [...room.players].sort((a, b) => a.seat - b.seat);
   app.innerHTML = `
-    <div class="top-links"><span class="hint" style="margin:0;">Hosting online</span><span class="hint" style="margin:0;">${players.length} at the table</span></div>
+    <div class="top-links"><button class="link-btn" id="btn-leave-lobby">← Cancel</button><span class="hint" style="margin:0;">${players.length} at the table</span></div>
     <div class="card" style="margin-bottom:16px;text-align:center;">
       <label>Room code — share it any way you like</label>
       <div class="room-code-display mono">${code}</div>
@@ -1956,6 +1957,10 @@ function renderOnlineHostLobby(code) {
       <p class="hint" style="margin:0 0 12px;">Blinds ${room.smallBlind}/${room.bigBlind}, max bet ${room.maxBet}, starting stack ${room.startingStack.toLocaleString()} each.</p>
       <button class="btn-primary btn-block" id="btn-start" ${players.length < 2 ? 'disabled' : ''}>${players.length < 2 ? 'Waiting for players\u2026' : 'Deal me in \u2014 start the game'}</button>
     </div>`;
+  document.getElementById('btn-leave-lobby').onclick = () => {
+    if (!confirm('Cancel hosting this table?')) return;
+    location.reload();
+  };
   document.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.up, -1); renderOnlineHostLobby(code); });
   document.querySelectorAll('[data-down]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.down, 1); renderOnlineHostLobby(code); });
   const startBtn = document.getElementById('btn-start');
@@ -2029,12 +2034,14 @@ function renderHostSetup() {
     err.classList.add('hidden');
     startingStackForHistory = stack;
     historySaved = false;
+    onlineRoomCode = null; // starting a fresh offline table — clear any stale online-mode state
     host = new HostController(name, {
       startingStack: stack, startingBet: bet, maxBet: max,
       onStateChange: (room) => { onRoomUpdated(room); },
     });
     me = { isHost: true, playerId: host.hostPlayerId, name };
     currentRoom = host.room;
+    gameAreaActive = true; // connected + past setup — room updates (like a guest joining) should now live-refresh the screen
     renderHostLobby();
   };
 }
@@ -2043,6 +2050,11 @@ function onRoomUpdated(newRoom) {
   detectAndFireFeedback(currentRoom, newRoom);
   const prevRoom = currentRoom;
   currentRoom = newRoom;
+  // Re-render whenever we're actually connected and past setup — this must
+  // NOT be gated on "has the game started", or the host's lobby view goes
+  // stale the moment someone joins (guests already refresh correctly here;
+  // hosts previously didn't, because this only fired once "Start" was
+  // clicked — a newly-joined player just silently wasn't shown).
   if (gameAreaActive) renderGameArea(newRoom);
   maybeTriggerChipFly(prevRoom, newRoom);
   if (newRoom.status === 'over' && !historySaved) {
@@ -2050,6 +2062,7 @@ function onRoomUpdated(newRoom) {
     saveGameToHistory(buildHistoryEntry(newRoom, startingStackForHistory || newRoom.startingStack, me.isHost));
   }
 }
+var onlineRoomCode = null;
 
 let lastChipFlyHand = null;
 function maybeTriggerChipFly(prevRoom, newRoom) {
@@ -2065,12 +2078,11 @@ function maybeTriggerChipFly(prevRoom, newRoom) {
 
 /* ---------- Host: lobby (add players via QR, reorder, start) ---------- */
 function renderHostLobby() {
-  gameAreaActive = false;
   app.classList.remove('has-bottom-nav');
   const room = host.room;
   const players = [...room.players].sort((a, b) => a.seat - b.seat);
   app.innerHTML = `
-    <div class="top-links"><span class="hint" style="margin:0;">Hosting</span><span class="hint" style="margin:0;">${players.length} at the table</span></div>
+    <div class="top-links"><button class="link-btn" id="btn-leave-lobby">← Cancel</button><span class="hint" style="margin:0;">${players.length} at the table</span></div>
     <div class="card" style="margin-bottom:16px;">
       <label>Players ${players.length > 1 ? '(▲▼ to match your actual seating)' : ''}</label>
       <ul class="lobby-players" id="lobby-list">
@@ -2095,6 +2107,10 @@ function renderHostLobby() {
       <button class="btn-primary btn-block" id="btn-start" ${players.length < 2 ? 'disabled' : ''}>${players.length < 2 ? 'Need at least 2 players' : 'Deal me in — start the game'}</button>
     </div>`;
 
+  document.getElementById('btn-leave-lobby').onclick = () => {
+    if (!confirm('Cancel hosting this table?')) return;
+    location.reload();
+  };
   document.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.up, -1); renderHostLobby(); });
   document.querySelectorAll('[data-down]').forEach(b => b.onclick = () => { host.localReorderSeat(b.dataset.down, 1); renderHostLobby(); });
   document.getElementById('btn-add-player').onclick = startAddPlayerFlow;
@@ -2434,7 +2450,8 @@ function renderGameArea(room) {
   if (!room) return;
   if (room.status === 'lobby') {
     app.classList.remove('has-bottom-nav');
-    if (me.isHost) { renderHostLobby(); } else { renderGuestWaitingLobby(room); }
+    if (me.isHost) { onlineRoomCode ? renderOnlineHostLobby(onlineRoomCode) : renderHostLobby(); }
+    else { renderGuestWaitingLobby(room); }
     return;
   }
   renderInGameShell(room);
@@ -2444,6 +2461,7 @@ function renderGuestWaitingLobby(room) {
   const players = [...room.players].sort((a, b) => a.seat - b.seat);
   app.innerHTML = `
     <div class="center-col">
+      <div class="top-links"><button class="link-btn" id="btn-leave-lobby">← Leave</button><span></span></div>
       <div class="card">
         <label style="text-align:center;">You're in — waiting for the host to start</label>
         <ul class="lobby-players" style="margin-top:10px;">
@@ -2452,6 +2470,10 @@ function renderGuestWaitingLobby(room) {
         <p class="hint" style="text-align:center;margin-top:12px;">Blinds ${room.smallBlind}/${room.bigBlind} · starting stack ${room.startingStack.toLocaleString()}</p>
       </div>
     </div>`;
+  document.getElementById('btn-leave-lobby').onclick = () => {
+    if (!confirm('Leave this table?')) return;
+    location.reload();
+  };
 }
 
 function renderInGameShell(room) {
