@@ -884,6 +884,23 @@ class HostController {
     const tmp = sorted[idx].seat; sorted[idx].seat = sorted[swapIdx].seat; sorted[swapIdx].seat = tmp;
     this.broadcast();
   }
+  // Adds a player with no network connection at all — used by bookkeeper
+  // mode, where one device runs the entire table for everyone (real cards,
+  // no phones for anyone else) and just needs more named seats, not more
+  // connections. Reuses the exact same player object shape as a networked
+  // join, so every other piece of game logic works completely unchanged.
+  addLocalPlayer(name) {
+    const newId = uid();
+    this.room.players.push({ id: newId, name, seat: this.room.players.length, stack: this.room.startingStack, connected: true, eliminated: false, folded: false, allIn: false, contributedThisStreet: 0, contributedThisHand: 0 });
+    this.broadcast();
+    return newId;
+  }
+  removeLocalPlayer(playerId) {
+    if (this.room.status !== 'lobby') return; // only safe to remove before the game starts
+    this.room.players = this.room.players.filter(p => p.id !== playerId);
+    this.room.players.sort((a, b) => a.seat - b.seat).forEach((p, i) => { p.seat = i; }); // re-pack seat numbers
+    this.broadcast();
+  }
   // Best-effort notice sent to every connected guest right before the host
   // leaves — the game genuinely can't continue without whoever holds the
   // authoritative state, so guests should be told clearly rather than just
@@ -1893,10 +1910,15 @@ function renderOfflineChoice() {
         <div class="suit-badge">♣</div>
         <div><div class="big-card-title">Join a table</div><div class="big-card-sub">Connect to an existing game</div></div>
       </div>
+      <div class="big-card" id="btn-bookkeeper">
+        <div class="suit-badge">📝</div>
+        <div><div class="big-card-title">Score for the table</div><div class="big-card-sub">One phone runs it all — everyone else just plays with real cards</div></div>
+      </div>
     </div>`;
   document.getElementById('btn-back').onclick = renderLanding;
   document.getElementById('btn-host').onclick = renderHostSetup;
   document.getElementById('btn-join').onclick = renderGuestNameEntry;
+  document.getElementById('btn-bookkeeper').onclick = renderBookkeeperSetup;
 }
 
 function renderOnlineChoice() {
@@ -2051,6 +2073,105 @@ function renderOnlineGuestEntry() {
 }
 
 /* ---------- Host: setup ---------- */
+/* ---------- Bookkeeper mode: one device runs the whole table locally,
+   no network/pairing at all — everyone else just plays with real cards
+   while the operator inputs each turn on their behalf. ---------- */
+let bookkeeperNames = [];
+
+function renderBookkeeperSetup() {
+  bookkeeperNames = [];
+  app.innerHTML = `
+    <div class="center-col">
+      <div class="top-links"><button class="link-btn" id="btn-back">← Back</button></div>
+      <div class="landing-hero"><h1 class="display" style="font-size:22px;">Score for the table</h1><p class="tagline">Add everyone playing, set the stakes, then start — no phones needed for anyone else.</p></div>
+      <div class="card">
+        <div class="field"><label for="bk-stack">Starting stack (each player)</label><input type="number" id="bk-stack" value="10000" min="100" step="100"></div>
+        <div class="field"><label for="bk-bet">Starting bet (the big blind)</label><input type="number" id="bk-bet" value="200" min="10" step="10"></div>
+        <p class="hint" style="margin-top:-6px;">Small blind is automatically half of this.</p>
+        <div class="field"><label for="bk-max">Max bet per raise</label><input type="number" id="bk-max" value="2000" min="100" step="100"></div>
+      </div>
+      <div class="card">
+        <label>Players (in seating order — ▲▼ to match how everyone's actually sitting)</label>
+        <div class="row" style="margin-bottom:10px;">
+          <input type="text" id="bk-name-input" placeholder="Player name" maxlength="18">
+          <button class="btn-primary" id="bk-add-name" style="flex:0 0 auto;">Add</button>
+        </div>
+        <ul class="lobby-players" id="bk-player-list"></ul>
+        <p class="error-text hidden" id="bk-err"></p>
+      </div>
+      <button class="btn-primary btn-block" id="bk-start" disabled>Add at least 2 players</button>
+    </div>`;
+  document.getElementById('btn-back').onclick = renderOfflineChoice;
+  renderBookkeeperPlayerList();
+
+  const nameInput = document.getElementById('bk-name-input');
+  const addName = () => {
+    const name = nameInput.value.trim();
+    const errEl = document.getElementById('bk-err');
+    if (!name) return;
+    if (bookkeeperNames.includes(name)) { errEl.textContent = 'Already added — names must be unique.'; errEl.classList.remove('hidden'); return; }
+    errEl.classList.add('hidden');
+    bookkeeperNames.push(name);
+    nameInput.value = '';
+    renderBookkeeperPlayerList();
+    nameInput.focus();
+  };
+  document.getElementById('bk-add-name').onclick = addName;
+  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addName(); } });
+
+  document.getElementById('bk-start').onclick = () => {
+    if (bookkeeperNames.length < 2) return;
+    const stack = parseInt(document.getElementById('bk-stack').value, 10) || 10000;
+    const bet = parseInt(document.getElementById('bk-bet').value, 10) || 200;
+    const max = parseInt(document.getElementById('bk-max').value, 10) || 2000;
+    startingStackForHistory = stack;
+    historySaved = false;
+    onlineRoomCode = null;
+    host = new HostController(bookkeeperNames[0], {
+      startingStack: stack, startingBet: bet, maxBet: max,
+      onStateChange: (room) => { onRoomUpdated(room); },
+    });
+    for (let i = 1; i < bookkeeperNames.length; i++) host.addLocalPlayer(bookkeeperNames[i]);
+    me = { isHost: true, playerId: null, name: 'Scorekeeper', bookkeeperMode: true };
+    currentRoom = host.room;
+    gameAreaActive = true;
+    activeTab = 'table';
+    host.localStartGame();
+  };
+}
+
+function renderBookkeeperPlayerList() {
+  const list = document.getElementById('bk-player-list');
+  list.innerHTML = bookkeeperNames.map((name, i) => `
+    <li>
+      <span class="seat-num">${i + 1}</span>
+      <span class="pname">${escapeHtml(name)}</span>
+      <span class="reorder-btns">
+        <button class="btn-ghost" data-bk-up="${i}" ${i === 0 ? 'disabled' : ''}>▲</button>
+        <button class="btn-ghost" data-bk-down="${i}" ${i === bookkeeperNames.length - 1 ? 'disabled' : ''}>▼</button>
+      </span>
+      <button class="link-btn" data-bk-remove="${i}" style="margin-left:6px;">✕</button>
+    </li>`).join('');
+  list.querySelectorAll('[data-bk-up]').forEach(b => b.onclick = () => {
+    const i = parseInt(b.dataset.bkUp, 10);
+    [bookkeeperNames[i - 1], bookkeeperNames[i]] = [bookkeeperNames[i], bookkeeperNames[i - 1]];
+    renderBookkeeperPlayerList();
+  });
+  list.querySelectorAll('[data-bk-down]').forEach(b => b.onclick = () => {
+    const i = parseInt(b.dataset.bkDown, 10);
+    [bookkeeperNames[i + 1], bookkeeperNames[i]] = [bookkeeperNames[i], bookkeeperNames[i + 1]];
+    renderBookkeeperPlayerList();
+  });
+  list.querySelectorAll('[data-bk-remove]').forEach(b => b.onclick = () => {
+    const i = parseInt(b.dataset.bkRemove, 10);
+    bookkeeperNames.splice(i, 1);
+    renderBookkeeperPlayerList();
+  });
+  const startBtn = document.getElementById('bk-start');
+  startBtn.disabled = bookkeeperNames.length < 2;
+  startBtn.textContent = bookkeeperNames.length < 2 ? 'Add at least 2 players' : `Start game (${bookkeeperNames.length} players)`;
+}
+
 function renderHostSetup() {
   app.innerHTML = `
     <div class="center-col">
@@ -2772,7 +2893,10 @@ function playerCardHtml(room, p, opts) {
 function renderTableTab(room, container) {
   const order = seatOrderOf(room);
   const meP = room.players.find(p => p.id === me.playerId);
-  const isMyTurn = room.turnPlayerId === me.playerId;
+  // In bookkeeper mode there's no "me" seated at the table — the operator
+  // acts on behalf of whoever's turn it currently is instead.
+  const activeP = me.bookkeeperMode ? room.players.find(p => p.id === room.turnPlayerId) : meP;
+  const isMyTurn = me.bookkeeperMode ? !!activeP : room.turnPlayerId === me.playerId;
   let sbId = null, bbId = null;
   if (order.length >= 2) {
     if (order.length === 2) { sbId = room.dealerId; bbId = nextPlayerAfter(order, room.dealerId).id; }
@@ -2796,7 +2920,7 @@ function renderTableTab(room, container) {
       <div class="pot-box"><div class="pot-label">Pot</div><div class="pot-amount mono" id="pot-amount" style="view-transition-name:vt-pot;">${room.pot.toLocaleString()}</div></div>
       <div style="width:70px;text-align:right;">
         <div class="pot-label">To call</div>
-        <div class="mono" style="font-size:16px;color:${meP && toCallFor(room, meP) > 0 ? 'var(--gold-bright)' : 'var(--ink-faint)'}">${meP ? toCallFor(room, meP) : '—'}</div>
+        <div class="mono" style="font-size:16px;color:${activeP && toCallFor(room, activeP) > 0 ? 'var(--gold-bright)' : 'var(--ink-faint)'}">${activeP ? toCallFor(room, activeP) : '—'}</div>
       </div>
     </div>
     <div class="players-list" style="display:flex;flex-direction:column;gap:10px;">
@@ -2810,7 +2934,7 @@ function renderTableTab(room, container) {
   const actionBar = document.getElementById('action-bar');
   if (room.street === 'showdown') renderShowdownPanel(room, actionBar);
   else if (room.street === 'handover') renderHandoverPanel(room, actionBar);
-  else if (isMyTurn && meP && !meP.folded && !meP.eliminated) renderActionPanel(room, meP, actionBar);
+  else if (isMyTurn && activeP && !activeP.folded && !activeP.eliminated) renderActionPanel(room, activeP, actionBar, me.bookkeeperMode);
   else {
     const turnP = room.players.find(p => p.id === room.turnPlayerId);
     const disconnectedHint = turnP && !turnP.connected
@@ -2832,10 +2956,11 @@ function tweenVisibleNumbers(room, container) {
   });
 }
 
-function renderActionPanel(room, meP, container) {
+function renderActionPanel(room, meP, container, isBookkeeper) {
   const toCall = toCallFor(room, meP);
   const canCheck = toCall === 0;
   container.innerHTML = `
+    ${isBookkeeper ? `<div class="pc-your-turn" style="display:block;text-align:center;margin-bottom:10px;">⚡ ${escapeHtml(meP.name)}'s turn</div>` : ''}
     <div class="action-grid">
       <button class="btn-danger" id="act-fold">Fold</button>
       <button class="btn-primary" id="act-callcheck">${canCheck ? 'Check' : `Call ${toCall}`}</button>
@@ -2848,7 +2973,51 @@ function renderActionPanel(room, meP, container) {
   document.getElementById('act-callcheck').onclick = () => doAction(canCheck ? 'check' : 'call');
   document.getElementById('act-allin').onclick = () => doAction('allin');
   const raiseBtn = document.getElementById('act-open-raise');
-  if (raiseBtn) raiseBtn.onclick = () => openRaiseSheet(room, meP);
+  if (raiseBtn) raiseBtn.onclick = () => isBookkeeper ? openTypedRaiseSheet(room, meP) : openRaiseSheet(room, meP);
+}
+
+// Bookkeeper mode: a plain typed number instead of a drag slider — the
+// operator is reading an exact amount off physical chips under time
+// pressure, so typing the number is faster and more precise than dragging.
+function openTypedRaiseSheet(room, meP) {
+  const minRaise = Math.min(room.currentBet + room.bigBlind, room.maxBet, meP.stack + meP.contributedThisStreet);
+  const maxRaise = Math.min(room.maxBet, meP.stack + meP.contributedThisStreet);
+  const backdrop = document.createElement('div');
+  backdrop.className = 'sheet-backdrop';
+  const sheet = document.createElement('div');
+  sheet.className = 'bottom-sheet';
+  sheet.innerHTML = `
+    <div class="sheet-handle"></div>
+    <div class="sheet-title">${escapeHtml(meP.name)} raises to</div>
+    <input type="number" id="typed-raise-input" class="sheet-amount mono" style="width:100%;text-align:center;background:rgba(0,0,0,0.25);border:1px solid var(--line);border-radius:10px;padding:10px;" min="${minRaise}" max="${maxRaise}" step="${Math.max(10, room.bigBlind)}" value="${minRaise}">
+    <p class="hint" style="text-align:center;">Between ${minRaise.toLocaleString()} and ${maxRaise.toLocaleString()}</p>
+    <p class="error-text hidden" id="typed-raise-err" style="text-align:center;"></p>
+    <div class="sheet-actions">
+      <button class="btn-ghost" id="sheet-cancel">Cancel</button>
+      <button class="btn-primary" id="sheet-confirm">Raise</button>
+    </div>`;
+  document.body.appendChild(backdrop);
+  document.body.appendChild(sheet);
+  requestAnimationFrame(() => { backdrop.classList.add('open'); sheet.classList.add('open'); document.getElementById('typed-raise-input').focus(); });
+
+  const closeSheet = () => {
+    backdrop.classList.remove('open'); sheet.classList.remove('open');
+    setTimeout(() => { backdrop.remove(); sheet.remove(); }, 240);
+  };
+  backdrop.onclick = closeSheet;
+  document.getElementById('sheet-cancel').onclick = closeSheet;
+  document.getElementById('sheet-confirm').onclick = () => {
+    const input = document.getElementById('typed-raise-input');
+    const errEl = document.getElementById('typed-raise-err');
+    const val = parseInt(input.value, 10);
+    if (!val || val < minRaise || val > maxRaise) {
+      errEl.textContent = `Enter an amount between ${minRaise.toLocaleString()} and ${maxRaise.toLocaleString()}.`;
+      errEl.classList.remove('hidden');
+      return;
+    }
+    closeSheet();
+    doAction('raise', val);
+  };
 }
 
 function openRaiseSheet(room, meP) {
@@ -2891,7 +3060,8 @@ function doAction(action, amount) {
   if (submitting) return;
   submitting = true;
   try {
-    if (me.isHost) host.applyLocalAction(action, amount);
+    if (me.bookkeeperMode) host.forceAction(currentRoom.turnPlayerId, action, amount);
+    else if (me.isHost) host.applyLocalAction(action, amount);
     else guest.sendAction(action, amount);
   } catch (e) { alert(e.message); }
   finally { submitting = false; }
@@ -3004,7 +3174,7 @@ function renderSettingsTab(room, container) {
       <p class="hint" style="text-align:center;margin:10px 0 0;">Resets everyone's stack and starts a fresh hand #1 — same table, no need to reconnect anyone.</p>
     </div>` : ''}
     <div class="card">
-      <button class="btn-danger btn-block" id="settings-leave">Leave table</button>
+      <button class="btn-danger btn-block" id="settings-leave">${me.bookkeeperMode ? 'End session' : 'Leave table'}</button>
     </div>`;
   document.getElementById('sound-toggle').onchange = (e) => { setSoundMuted(!e.target.checked); };
   document.getElementById('settings-install').onclick = handleInstallClick;
@@ -3016,11 +3186,13 @@ function renderSettingsTab(room, container) {
     host.doRematch();
   };
   document.getElementById('settings-leave').onclick = async () => {
-    const msg = me.isHost
-      ? 'Leave this table? This ends the game for everyone still connected.'
-      : 'Leave this table? You can rejoin with the same name if the host adds you again.';
+    const msg = me.bookkeeperMode
+      ? 'End this session? All scores will be lost unless you note them down.'
+      : me.isHost
+        ? 'Leave this table? This ends the game for everyone still connected.'
+        : 'Leave this table? You can rejoin with the same name if the host adds you again.';
     if (!await customConfirm(msg)) return;
-    if (me.isHost && host) host.broadcastHostLeaving();
+    if (me.isHost && !me.bookkeeperMode && host) host.broadcastHostLeaving();
     else if (guest) guest.sendLeave();
     location.reload();
   };
