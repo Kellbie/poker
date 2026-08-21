@@ -845,6 +845,15 @@ class HostController {
     if (gameIsOver(this.room)) this.room.status = 'over';
     this.broadcast();
   }
+  // Acts on behalf of ANY player, not just the host — used specifically to
+  // auto-fold a disconnected player whose turn it is, since applyLocalAction
+  // always acts as the host and would just fail with "Not your turn" for
+  // anyone else.
+  forceAction(playerId, action, amount) {
+    applyAction(this.room, playerId, action, amount);
+    if (gameIsOver(this.room)) this.room.status = 'over';
+    this.broadcast();
+  }
   localDeclareWinners(winnerIds) {
     resolveShowdown(this.room, winnerIds);
     if (gameIsOver(this.room)) this.room.status = 'over';
@@ -2091,10 +2100,47 @@ function onRoomUpdated(newRoom) {
   // clicked — a newly-joined player just silently wasn't shown).
   if (gameAreaActive) renderGameArea(newRoom);
   maybeTriggerChipFly(prevRoom, newRoom);
+  maybeScheduleAutoFold(newRoom);
   if (newRoom.status === 'over' && !historySaved) {
     historySaved = true;
     saveGameToHistory(buildHistoryEntry(newRoom, startingStackForHistory || newRoom.startingStack, me.isHost));
   }
+}
+
+/* ---------- Auto-fold a disconnected player whose turn it is ----------
+   Without this, a player who leaves (or just drops connection) mid-hand
+   can leave the WHOLE TABLE stuck forever once it becomes their turn —
+   nobody else can act, and there was previously no way to move on. Only
+   the host schedules/executes this, since only the host can actually
+   advance game state. A short grace period allows for a brief reconnect
+   before the auto-fold actually happens. */
+let autoFoldTimer = null;
+let autoFoldKey = null;
+var AUTO_FOLD_DELAY_MS = 8000;
+
+function maybeScheduleAutoFold(room) {
+  if (!me.isHost || !host || !room) return;
+  const turnP = room.players.find(p => p.id === room.turnPlayerId);
+  const isWaitingOnDisconnected = room.status === 'playing' && room.street !== 'showdown' && room.street !== 'handover' && !!turnP && !turnP.connected;
+  const key = isWaitingOnDisconnected ? `${room.turnPlayerId}|${room.handNumber}|${room.street}` : null;
+
+  if (key === autoFoldKey) return; // situation unchanged — timer (if any) is already correctly scheduled
+
+  if (autoFoldTimer) { clearTimeout(autoFoldTimer); autoFoldTimer = null; }
+  autoFoldKey = key;
+  if (!key) return; // no longer waiting on a disconnected player's turn
+
+  autoFoldTimer = setTimeout(() => {
+    autoFoldTimer = null;
+    if (autoFoldKey !== key) return; // situation moved on before the timer fired
+    if (!currentRoom) return;
+    const stillSameTurn = currentRoom.turnPlayerId === room.turnPlayerId
+      && currentRoom.handNumber === room.handNumber
+      && currentRoom.street === room.street;
+    const p = currentRoom.players.find(pl => pl.id === room.turnPlayerId);
+    if (!stillSameTurn || !p || p.connected) return; // they reconnected or the turn already moved on
+    try { host.forceAction(room.turnPlayerId, 'fold'); } catch (e) { /* already resolved somehow — safe to ignore */ }
+  }, AUTO_FOLD_DELAY_MS);
 }
 var onlineRoomCode = null;
 
@@ -2767,7 +2813,10 @@ function renderTableTab(room, container) {
   else if (isMyTurn && meP && !meP.folded && !meP.eliminated) renderActionPanel(room, meP, actionBar);
   else {
     const turnP = room.players.find(p => p.id === room.turnPlayerId);
-    actionBar.innerHTML = `<div class="waiting-note">${turnP ? `Waiting for <strong>${escapeHtml(turnP.name)}</strong>…` : 'Waiting…'}</div>`;
+    const disconnectedHint = turnP && !turnP.connected
+      ? `<div class="hint" style="margin-top:6px;">They're offline — will auto-fold in a moment if they don't reconnect.</div>`
+      : '';
+    actionBar.innerHTML = `<div class="waiting-note">${turnP ? `Waiting for <strong>${escapeHtml(turnP.name)}</strong>…` : 'Waiting…'}${disconnectedHint}</div>`;
   }
   const logPanel = document.getElementById('log-panel');
   if (logPanel) logPanel.scrollTop = logPanel.scrollHeight;
@@ -2949,11 +2998,23 @@ function renderSettingsTab(room, container) {
       <button class="btn-ghost btn-block" id="settings-install">📲 Add to home screen</button>
       <p class="hint" style="text-align:center;margin:10px 0 0;">Tip: swipe left/right on any tab to switch, or long-press a player card for details.</p>
     </div>
+    ${me.isHost ? `
+    <div class="card" style="margin-bottom:16px;">
+      <button class="btn-primary btn-block" id="settings-restart">🔄 Restart game</button>
+      <p class="hint" style="text-align:center;margin:10px 0 0;">Resets everyone's stack and starts a fresh hand #1 — same table, no need to reconnect anyone.</p>
+    </div>` : ''}
     <div class="card">
       <button class="btn-danger btn-block" id="settings-leave">Leave table</button>
     </div>`;
   document.getElementById('sound-toggle').onchange = (e) => { setSoundMuted(!e.target.checked); };
   document.getElementById('settings-install').onclick = handleInstallClick;
+  const restartBtn = document.getElementById('settings-restart');
+  if (restartBtn) restartBtn.onclick = async () => {
+    if (!await customConfirm("Restart the game? Everyone's stack resets to the starting amount and hand count goes back to #1 — the current hand's cards are abandoned.")) return;
+    historySaved = false;
+    activeTab = 'table';
+    host.doRematch();
+  };
   document.getElementById('settings-leave').onclick = async () => {
     const msg = me.isHost
       ? 'Leave this table? This ends the game for everyone still connected.'
