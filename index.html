@@ -875,7 +875,18 @@ if (typeof window !== 'undefined') { window.HostController = HostController; win
 
 
 /* ---- WebRTC signaling (LAN-only, no STUN/TURN since there's no internet) ---- */
-const RTC_CONFIG = { iceServers: [] };
+// Empty iceServers keeps candidate gathering fast and LAN-only when everyone's
+// on the same hotspot (no wasted time probing servers you don't need). Adding
+// a public STUN server costs nothing for that same-hotspot case (the LAN
+// candidates still win, since they're gathered fastest and preferred) but
+// means devices that AREN'T on the same network — genuinely remote friends,
+// or a hotspot with unusual NAT behavior — get a real shot at connecting too.
+// STUN only ever *discovers* your own public address; it never sees or
+// relays any game traffic. This is the one case where the app briefly
+// contacts an external server — only to ask "what's my public IP", and only
+// if you have internet at all. On a true offline hotspot it just times out
+// silently and the LAN candidates carry the connection as before.
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 function waitIceGatheringComplete(pc, timeoutMs) {
   return new Promise((resolve) => {
@@ -916,16 +927,28 @@ function minifySdpCandidates(sdp, maxCandidates) {
     return { line, proto, priority, ip, typ, isIPv4 };
   });
 
-  // Prefer: UDP over TCP, host candidates (should be the only kind since
-  // iceServers is empty), IPv4 over IPv6, then highest priority first.
-  const filtered = parsed
-    .filter((c) => c.proto === 'udp' && c.typ === 'host')
-    .sort((a, b) => {
-      if (a.isIPv4 !== b.isIPv4) return a.isIPv4 ? -1 : 1;
-      return b.priority - a.priority;
-    })
-    .slice(0, maxCandidates)
-    .map((c) => c.line);
+  // Reserve a slot for the best srflx (STUN/public) candidate if one exists,
+  // so online/remote connectivity is always represented — otherwise, on a
+  // device with several LAN candidates, the srflx one could get crowded out
+  // entirely and "online mode" would silently never actually work.
+  const byType = (typ) => parsed
+    .filter((c) => c.proto === 'udp' && c.typ === typ)
+    .sort((a, b) => (a.isIPv4 !== b.isIPv4 ? (a.isIPv4 ? -1 : 1) : b.priority - a.priority));
+  const hostCandidates = byType('host');
+  const srflxCandidates = byType('srflx');
+
+  const keptSet = [];
+  if (srflxCandidates.length > 0) keptSet.push(srflxCandidates[0]);
+  for (const c of hostCandidates) {
+    if (keptSet.length >= maxCandidates) break;
+    keptSet.push(c);
+  }
+  // if there's still room and more than one srflx candidate exists, allow a second
+  for (const c of srflxCandidates.slice(1)) {
+    if (keptSet.length >= maxCandidates) break;
+    keptSet.push(c);
+  }
+  const filtered = keptSet.slice(0, maxCandidates).map((c) => c.line);
 
   // Fallback: if filtering somehow removed everything (unexpected candidate
   // format), keep the original candidates rather than produce a connection
@@ -1008,19 +1031,30 @@ function payloadToFrames(payloadStr) {
 }
 
 /* ---- QR rendering (uses inlined qrcode-generator lib, global `qrcode`) ---- */
+// A QR code needs a blank "quiet zone" border for a scanner to reliably lock
+// onto its finder patterns — without one, anything visually adjacent (a
+// heading, a background gradient) can throw off detection entirely. This
+// matters a lot more here than it would printed on paper, since the camera
+// is looking at the whole phone screen, not an isolated code on white space.
+const QR_QUIET_ZONE_MODULES = 4;
+
 function renderQrToCanvas(text, canvas, cellSize) {
   const qr = qrcode(0, 'L');
   qr.addData(text);
   qr.make();
   const count = qr.getModuleCount();
-  const size = count * cellSize;
+  const totalModules = count + QR_QUIET_ZONE_MODULES * 2;
+  const size = totalModules * cellSize;
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#f4ecd8'; ctx.fillRect(0, 0, size, size);
-  ctx.fillStyle = '#0a2a20';
+  // Pure black/white — the safest, most universally scannable choice.
+  // Colored codes CAN work but add risk under real-world lighting/white
+  // balance that isn't worth taking for something this important.
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#000000';
   for (let r = 0; r < count; r++) {
     for (let c = 0; c < count; c++) {
-      if (qr.isDark(r, c)) ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+      if (qr.isDark(r, c)) ctx.fillRect((c + QR_QUIET_ZONE_MODULES) * cellSize, (r + QR_QUIET_ZONE_MODULES) * cellSize, cellSize, cellSize);
     }
   }
 }
@@ -1745,6 +1779,7 @@ async function startAddPlayerFlow() {
     return;
   }
   showQrFrames(offerData.payload, canvas, frameLabel, nextBtn);
+  wireShareButton(offerData.payload, 'Ledger connection code');
 
   document.getElementById('qr-primary-btn').classList.remove('hidden');
   document.getElementById('qr-primary-btn').textContent = "They've got it — scan their code back";
@@ -1756,23 +1791,27 @@ async function startScanAnswerFlow(offerData) {
   app.innerHTML = renderScanScreenShell('Scan their code', 'Step 2 of 2 — scan their answer', 'Point your camera at the code on their screen.');
   const video = document.getElementById('scan-video');
   const canvas = document.getElementById('scan-canvas');
-  const progress = document.getElementById('scan-progress');
   document.getElementById('scan-cancel').onclick = () => { scanner.stop(); renderHostLobby(); };
+  wirePasteFallback(async (answerObj) => { scanner.stop(); await proceedWithAnswer(offerData, answerObj); });
 
   const scanner = new QrScanner(video, canvas);
   try {
     const answerObj = await runScanWithFeedback(scanner);
-    await applyHostAnswer(offerData.pc, answerObj);
-    app.innerHTML = renderConnectingShell('<span class="qr-spinner"></span>Connecting…');
-    await waitForOpen(offerData.dc, 8000);
-    const peerId = 'peer-' + Math.random().toString(36).slice(2);
-    const countBefore = host.room.players.length;
-    host.attachConnection(peerId, wrapDataChannel(offerData.dc));
-    const newName = await waitForNewPlayerName(countBefore, 3000);
-    showConnectedConfirmation(newName, renderHostLobby);
+    await proceedWithAnswer(offerData, answerObj);
   } catch (e) {
     showScanError(e.message || 'Could not connect — try again.', renderHostLobby);
   }
+}
+
+async function proceedWithAnswer(offerData, answerObj) {
+  await applyHostAnswer(offerData.pc, answerObj);
+  app.innerHTML = renderConnectingShell('<span class="qr-spinner"></span>Connecting…');
+  await waitForOpen(offerData.dc, 8000);
+  const peerId = 'peer-' + Math.random().toString(36).slice(2);
+  const countBefore = host.room.players.length;
+  host.attachConnection(peerId, wrapDataChannel(offerData.dc));
+  const newName = await waitForNewPlayerName(countBefore, 3000);
+  showConnectedConfirmation(newName, renderHostLobby);
 }
 
 function waitForNewPlayerName(countBefore, timeoutMs) {
@@ -1825,17 +1864,21 @@ async function startScanOfferFlow() {
   app.innerHTML = renderScanScreenShell('Scan host\u2019s code', 'Step 1 of 2 — scan to connect', 'Point your camera at the code on the host\u2019s screen.');
   const video = document.getElementById('scan-video');
   const canvas = document.getElementById('scan-canvas');
-  const progress = document.getElementById('scan-progress');
   document.getElementById('scan-cancel').onclick = () => { scanner.stop(); renderGuestNameEntry(); };
+  wirePasteFallback(async (offerObj) => { scanner.stop(); await proceedWithOffer(offerObj); });
 
   const scanner = new QrScanner(video, canvas);
   try {
     const offerObj = await runScanWithFeedback(scanner);
-    const { pc, dc, payload } = await createGuestAnswer(offerObj);
-    showAnswerQr(payload, pc, dc);
+    await proceedWithOffer(offerObj);
   } catch (e) {
     showScanError(e.message || 'Could not read that code — try again.', renderGuestNameEntry);
   }
+}
+
+async function proceedWithOffer(offerObj) {
+  const { pc, dc, payload } = await createGuestAnswer(offerObj);
+  showAnswerQr(payload, pc, dc);
 }
 
 function showAnswerQr(answerPayload, pc, dc) {
@@ -1846,6 +1889,7 @@ function showAnswerQr(answerPayload, pc, dc) {
   document.getElementById('qr-cancel').onclick = () => { stopQrLoop(); renderGuestNameEntry(); };
   document.getElementById('qr-primary-btn').classList.add('hidden');
   showQrFrames(answerPayload, canvas, frameLabel, nextBtn);
+  wireShareButton(answerPayload, 'Ledger connection code');
   document.getElementById('qr-waiting-note').classList.remove('hidden');
 
   waitForOpen(dc, 30000).then(() => {
@@ -1915,11 +1959,12 @@ function renderQrScreenShell(title, step, subtitle) {
         <div class="qr-step-label">${escapeHtml(step)}</div>
         <h2 class="display" style="font-size:20px;margin:0 0 4px;">${escapeHtml(title)}</h2>
         <p class="hint">${escapeHtml(subtitle)}</p>
-        <canvas id="qr-canvas" style="width:min(84vw,340px);height:min(84vw,340px);border-radius:10px;margin:12px auto;display:block;"></canvas>
+        <canvas id="qr-canvas" style="width:min(84vw,340px);height:min(84vw,340px);border-radius:10px;margin:12px auto;display:block;background:#fff;box-shadow:0 0 0 10px #fff, 0 4px 20px rgba(0,0,0,0.35);"></canvas>
         <p class="hint mono" id="qr-frame-label"></p>
         <button class="btn-primary btn-block hidden" id="qr-next-frame-btn" style="margin-top:6px;"></button>
         <p class="hint hidden" id="qr-waiting-note"><span class="qr-spinner"></span>Waiting for connection…</p>
         <button class="btn-primary btn-block hidden" id="qr-primary-btn" style="margin-top:10px;"></button>
+        <button class="link-btn" id="qr-share-btn" style="margin-top:10px;display:block;width:100%;">Camera trouble? Share this code instead →</button>
         <button class="btn-ghost btn-block" id="qr-cancel" style="margin-top:10px;">Cancel</button>
       </div>
     </div>`;
@@ -1937,10 +1982,60 @@ function renderScanScreenShell(title, step, subtitle) {
         <canvas id="scan-canvas" class="hidden"></canvas>
         <p class="hint mono" id="scan-progress"><span class="qr-spinner"></span>Starting camera…</p>
         <p class="hint hidden" id="scan-troubleshoot" style="color:var(--gold-bright);"></p>
+        <button class="link-btn" id="scan-paste-toggle" style="margin-top:6px;display:block;width:100%;">Or paste a code instead →</button>
+        <div class="hidden" id="scan-paste-panel" style="margin-top:10px;">
+          <textarea id="scan-paste-input" placeholder="Paste the shared code here" rows="3" style="width:100%;background:rgba(0,0,0,0.25);border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:10px 12px;font-family:ui-monospace,monospace;font-size:12px;"></textarea>
+          <button class="btn-primary btn-block" id="scan-paste-connect" style="margin-top:8px;">Connect</button>
+          <p class="error-text hidden" id="scan-paste-err"></p>
+        </div>
         <button class="btn-ghost btn-block" id="scan-cancel" style="margin-top:10px;">Cancel</button>
       </div>
     </div>`;
 }
+/* ---------- Share/paste fallback: bypasses the camera entirely ----------
+   Two people physically together can always exchange a short text blob some
+   other way — AirDrop, Nearby Share, or just pasting into any messaging app
+   — which sidesteps camera/lighting/focus issues completely. This shares
+   the FULL, un-chunked payload as plain text (no QR chunking needed here,
+   since text sharing has no scannability size limit). */
+async function wireShareButton(payloadStr, title) {
+  const btn = document.getElementById('qr-share-btn');
+  if (!btn) return;
+  btn.onclick = async () => {
+    if (navigator.share) {
+      try { await navigator.share({ title, text: payloadStr }); return; }
+      catch (e) { return; } // user cancelled the share sheet — not an error
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(payloadStr);
+        btn.textContent = 'Copied! Paste it to them in any app \u2192';
+        setTimeout(() => { btn.textContent = 'Camera trouble? Share this code instead \u2192'; }, 2500);
+        return;
+      } catch (e) { /* fall through */ }
+    }
+    alert(payloadStr); // last resort: manually selectable text
+  };
+}
+
+function wirePasteFallback(onPayload) {
+  const toggle = document.getElementById('scan-paste-toggle');
+  const panel = document.getElementById('scan-paste-panel');
+  const input = document.getElementById('scan-paste-input');
+  const connectBtn = document.getElementById('scan-paste-connect');
+  const errEl = document.getElementById('scan-paste-err');
+  if (!toggle) return;
+  toggle.onclick = () => { panel.classList.toggle('hidden'); };
+  connectBtn.onclick = async () => {
+    errEl.classList.add('hidden');
+    let parsed;
+    try { parsed = JSON.parse(input.value.trim()); }
+    catch (e) { errEl.textContent = "That doesn't look like a valid code \u2014 make sure you copied the whole thing."; errEl.classList.remove('hidden'); return; }
+    try { await onPayload(parsed); }
+    catch (e) { errEl.textContent = e.message || 'Could not connect with that code.'; errEl.classList.remove('hidden'); }
+  };
+}
+
 function renderConnectingShell(msgHtml) {
   return `<div class="center-col"><div class="card" style="text-align:center;"><p class="hint" style="font-size:15px;">${msgHtml}</p></div></div>`;
 }
