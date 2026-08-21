@@ -901,18 +901,14 @@ if (typeof window !== 'undefined') { window.HostController = HostController; win
 
 
 /* ---- WebRTC signaling (LAN-only, no STUN/TURN since there's no internet) ---- */
-// Empty iceServers keeps candidate gathering fast and LAN-only when everyone's
-// on the same hotspot (no wasted time probing servers you don't need). Adding
-// a public STUN server costs nothing for that same-hotspot case (the LAN
-// candidates still win, since they're gathered fastest and preferred) but
-// means devices that AREN'T on the same network — genuinely remote friends,
-// or a hotspot with unusual NAT behavior — get a real shot at connecting too.
-// STUN only ever *discovers* your own public address; it never sees or
-// relays any game traffic. This is the one case where the app briefly
-// contacts an external server — only to ask "what's my public IP", and only
-// if you have internet at all. On a true offline hotspot it just times out
-// silently and the LAN candidates carry the connection as before.
-const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+// This is the OFFLINE/QR path specifically — it should never need to reach
+// anything outside the local hotspot. (Online/internet connectivity is a
+// separate, dedicated mode using PeerJS, which manages its own connection
+// config entirely independently of this file.) Keeping this LAN-only
+// removes an unreachable external contact attempt and the extra candidate-
+// selection complexity that came with it — one less variable when
+// something's not connecting on a genuinely offline network.
+const RTC_CONFIG = { iceServers: [] };
 
 function waitIceGatheringComplete(pc, timeoutMs) {
   return new Promise((resolve) => {
@@ -953,28 +949,14 @@ function minifySdpCandidates(sdp, maxCandidates) {
     return { line, proto, priority, ip, typ, isIPv4 };
   });
 
-  // Reserve a slot for the best srflx (STUN/public) candidate if one exists,
-  // so online/remote connectivity is always represented — otherwise, on a
-  // device with several LAN candidates, the srflx one could get crowded out
-  // entirely and "online mode" would silently never actually work.
-  const byType = (typ) => parsed
-    .filter((c) => c.proto === 'udp' && c.typ === typ)
-    .sort((a, b) => (a.isIPv4 !== b.isIPv4 ? (a.isIPv4 ? -1 : 1) : b.priority - a.priority));
-  const hostCandidates = byType('host');
-  const srflxCandidates = byType('srflx');
-
-  const keptSet = [];
-  if (srflxCandidates.length > 0) keptSet.push(srflxCandidates[0]);
-  for (const c of hostCandidates) {
-    if (keptSet.length >= maxCandidates) break;
-    keptSet.push(c);
-  }
-  // if there's still room and more than one srflx candidate exists, allow a second
-  for (const c of srflxCandidates.slice(1)) {
-    if (keptSet.length >= maxCandidates) break;
-    keptSet.push(c);
-  }
-  const filtered = keptSet.slice(0, maxCandidates).map((c) => c.line);
+  // Prefer UDP host candidates: IPv4 over IPv6, then highest priority.
+  // (This path never gathers srflx/STUN candidates since RTC_CONFIG has no
+  // ICE servers — LAN-only, on purpose, for the offline mode.)
+  const filtered = parsed
+    .filter((c) => c.proto === 'udp' && c.typ === 'host')
+    .sort((a, b) => (a.isIPv4 !== b.isIPv4 ? (a.isIPv4 ? -1 : 1) : b.priority - a.priority))
+    .slice(0, maxCandidates)
+    .map((c) => c.line);
 
   // Fallback: if filtering somehow removed everything (unexpected candidate
   // format), keep the original candidates rather than produce a connection
@@ -1020,14 +1002,23 @@ function createGuestAnswer(offerObj) {
       // Bounded, unlike before — if ondatachannel never fires (malformed
       // offer, browser quirk, whatever), this now fails with a clear,
       // actionable message instead of hanging on "connecting…" forever.
+      // Includes live diagnostics in the error so a real failure here says
+      // something concrete about WHY, instead of just "it didn't work".
       const dcPromise = new Promise((res, rej) => {
         pc.ondatachannel = (e) => { dc = e.channel; res(e.channel); };
-        setTimeout(() => rej(new Error("Couldn't finish connecting — the code may be stale. Go back and get a fresh one.")), 6000);
+        setTimeout(() => {
+          const candidateCount = (offerObj.sdp.match(/a=candidate:/g) || []).length;
+          rej(new Error(
+            `Couldn't finish connecting (ice: ${pc.iceGatheringState}/${pc.iceConnectionState || 'n/a'}, ` +
+            `conn: ${pc.connectionState || 'n/a'}, candidates in code: ${candidateCount}). ` +
+            `The code may be stale — go back and get a fresh one.`
+          ));
+        }, 10000);
       });
       await pc.setRemoteDescription({ type: 'offer', sdp: offerObj.sdp });
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await waitIceGatheringComplete(pc, 4000);
+      await waitIceGatheringComplete(pc, 6000);
       await dcPromise;
       const trimmedSdp = minifySdpCandidates(pc.localDescription.sdp);
       const payload = JSON.stringify({ type: 'answer', sdp: trimmedSdp });
@@ -1053,13 +1044,25 @@ function waitForOpen(dc, timeoutMs) {
 // chunking, which still exists as a safety net with generous per-frame time.
 const QR_CHUNK_SIZE = 420;
 
+// Cheap checksum so a corrupted or mismatched reassembly (wrong chunk order,
+// a stale chunk from an earlier attempt, camera misread that still passed
+// its own frame-level error correction) gets caught immediately as "scan
+// corrupted, try again" — instead of silently producing bad connection data
+// that fails confusingly several steps later inside WebRTC negotiation.
+function simpleChecksum(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) { h = (h * 31 + str.charCodeAt(i)) | 0; }
+  return (h >>> 0).toString(36);
+}
+
 function payloadToFrames(payloadStr) {
+  const sum = simpleChecksum(payloadStr);
   if (payloadStr.length <= QR_CHUNK_SIZE) {
-    return [JSON.stringify({ i: 0, n: 1, c: payloadStr })];
+    return [JSON.stringify({ i: 0, n: 1, c: payloadStr, h: sum })];
   }
   const chunks = [];
   for (let i = 0; i < payloadStr.length; i += QR_CHUNK_SIZE) chunks.push(payloadStr.slice(i, i + QR_CHUNK_SIZE));
-  return chunks.map((c, i) => JSON.stringify({ i, n: chunks.length, c }));
+  return chunks.map((c, i) => JSON.stringify({ i, n: chunks.length, c, h: sum }));
 }
 
 /* ---- QR rendering (uses inlined qrcode-generator lib, global `qrcode`) ---- */
@@ -1169,12 +1172,26 @@ class QrScanner {
     let obj;
     try { obj = JSON.parse(raw); } catch (e) { return; } // not our format, ignore this frame
     if (typeof obj.i !== 'number' || typeof obj.n !== 'number' || typeof obj.c !== 'string') return;
+
+    // If this frame belongs to a DIFFERENT code than what we've been
+    // collecting (different total chunk count or checksum — e.g. someone
+    // accidentally scanned a stale/different code mid-attempt), reset and
+    // start fresh with this one rather than silently mixing pieces of two
+    // different codes together.
+    if (this.chunks.size > 0 && (obj.n !== this.totalChunks || obj.h !== this.expectedHash)) {
+      this.chunks = new Map();
+    }
     this.totalChunks = obj.n;
+    this.expectedHash = obj.h;
     this.chunks.set(obj.i, obj.c);
     this.onProgress(this.chunks.size, this.totalChunks);
     if (this.chunks.size === this.totalChunks) {
       const full = Array.from({ length: this.totalChunks }, (_, i) => this.chunks.get(i)).join('');
       this.stop();
+      if (this.expectedHash && simpleChecksum(full) !== this.expectedHash) {
+        this._reject(new Error('Scanned code was corrupted or mismatched — try again.'));
+        return;
+      }
       try {
         const parsed = JSON.parse(full);
         this._resolve(parsed);
